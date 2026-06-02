@@ -1,0 +1,6 @@
+{
+    "misskey_host": "example.com",
+    "misskey_admin_token": "your-token-here",
+    "nsfw_detect_api_endpoint": "https://api.example.com/nsfw-detect",
+    "local_only": false
+}

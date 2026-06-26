@@ -8,9 +8,13 @@ import logging
 from websockets.asyncio.client import connect
 
 # ログ設定
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("websockets").setLevel(logging.WARNING)
 CONFIG = {}
+MEDIA_IDS = set()
+USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36'
 
 def check_config():
     """設定ファイルの必須キーが存在するか確認"""
@@ -63,29 +67,37 @@ async def main():
                 if body.get('id', '') == 'tl' and body.get('type', '') == 'note':
                     note_body = body.get('body', {})
 
-                    # 画像ファイルのURLとファイルIDのリストを作成
+                    # ファイルのURLとファイルIDのリストを作成
                     # すでにセンシティブフラグが付いているものは二重チェック防止で無視する
-                    img_urls = [{'url': f['url'], 'fileId': f['id']} for f in note_body.get('files', []) if f.get('type', '').startswith('image/') and f.get('isSensitive', False) == False]
+                    # すでにチェックしたものは無視する
+                    img_urls = []
+                    for f in note_body.get('files', []):
+                        if f.get('type', '').startswith('image/') and f.get('isSensitive', False) == False and f['id'] not in MEDIA_IDS:
+                            img_urls.append({'url': f['url'], 'fileId': f['id']})
+                            MEDIA_IDS.add(f['id'])
 
                     # マルチスレッドで実行
                     for img_url in img_urls:
                         asyncio.create_task(classify(img_url['url'], img_url['fileId']))
 
 async def classify(img_url, fileId):
-
     logger = logging.getLogger('classify')
-    http_client = httpx.AsyncClient()
+    http_client = httpx.AsyncClient(
+        headers={'User-Agent': USER_AGENT},
+        timeout=httpx.Timeout(10.0, connect=5.0)
+    )
 
     logger.info(f'Classifying image: {img_url}')
 
     # 画像をダウンロード
-    res = await http_client.get(img_url)
+    res = await http_client.get(img_url, follow_redirects=True)
     img_bytes = res.content
 
     # 評価実行
+    is_nsfw = False
     eval_req = await http_client.post(
         CONFIG['nsfw_detect_api_endpoint'],
-        files={'file': img_bytes}
+        files={'image0': img_bytes}
     )
     if not eval_req.status_code == 200:
         logger.error(f'Failed to classify for {img_url}')
@@ -93,11 +105,24 @@ async def classify(img_url, fileId):
         return
 
     eval_res = eval_req.json()
+    if eval_res.get('success', False) == False:
+        logger.error(f'Failed to classify for {img_url}')
+        logger.error(json.dumps(eval_res, indent=2, ensure_ascii=True))
+        return
+    
+    result = eval_res['result']['results'][0]
+    if result.get('success', False) == False:
+        logger.error(f'Failed to classify for {img_url}')
+        logger.error(json.dumps(eval_res, indent=2, ensure_ascii=True))
+        return
 
-    is_nsfw = eval_res['is_nsfw']
-    logger.debug(f'Result for {img_url}: {eval_res}')
+    s_pred = [x for x in result['predictions'] if x['className'] == 'Sexy'][0]['probability']
+    h_pred = [x for x in result['predictions'] if x['className'] == 'Hentai'][0]['probability']
+    is_nsfw = (s_pred >= 0.9 or h_pred >= 0.9)
+    
+    logger.debug(f'Result for {img_url}: {is_nsfw}')
 
-    # センシティブフラグを付ける
+    #センシティブフラグを付ける
     if is_nsfw:
         logger.info(f'Marking image as sensitive: fileId={fileId}')
         req = await http_client.post(
